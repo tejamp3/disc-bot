@@ -1,5 +1,8 @@
 """Collect recent AI news from RSS/Atom feeds and post a digest to Discord and/or Telegram.
 
+With OPENROUTER_API_KEY set, a team of AI agents (see agents.py) researches, curates and summarizes the
+stories first. Without it, or if the agents fail, the digest is the plain headlines grouped by source.
+
 Usage:
     python ai_news.py             # post the digest to every configured destination
     python ai_news.py --dry-run   # print the digest instead of posting
@@ -8,6 +11,8 @@ Environment (at least one destination is required unless --dry-run):
     DISCORD_WEBHOOK_URL   Discord channel webhook
     TELEGRAM_BOT_TOKEN    Telegram bot token from @BotFather
     TELEGRAM_CHAT_ID      Telegram chat, group or channel to post to
+    OPENROUTER_API_KEY    Enables the AI editor (optional)
+    OPENROUTER_MODEL      Model for the AI editor (default: a free NVIDIA Nemotron model)
     LOOKBACK_HOURS        Only include items newer than this (default 24)
     MAX_PER_SOURCE        Cap on items per source (default 5)
 """
@@ -25,6 +30,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 import feedparser
+
+import agents
 
 FEEDS = {
     "OpenAI": "https://openai.com/news/rss.xml",
@@ -77,7 +84,8 @@ def fetch_items(name: str, url: str, since: float, limit: int) -> list[dict]:
         title = re.sub(r"\s+", " ", entry.get("title", "")).strip() or entry.link
         if name in FILTERED_SOURCES and not AI_KEYWORDS.search(title):
             continue
-        items.append({"title": title, "link": entry.link, "ts": ts})
+        snippet = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", entry.get("summary", "")))).strip()
+        items.append({"title": title, "link": entry.link, "ts": ts, "snippet": snippet[:300]})
     items.sort(key=lambda i: i["ts"], reverse=True)
     return items[:limit]
 
@@ -108,7 +116,15 @@ def escape_md(text: str) -> str:
 def build_embeds(digest: dict[str, list[dict]]) -> list[dict]:
     embeds = []
     for source, items in digest.items():
-        lines = [f"• [{escape_md(i['title'][:200])}]({i['link']})" for i in items]
+        lines = []
+        for i in items:
+            line = f"• [{escape_md(i['title'][:200])}]({i['link']})"
+            # Only AI-edited digests carry a source and summary per story.
+            if i.get("source"):
+                line += f" · *{escape_md(i['source'])}*"
+            if i.get("summary"):
+                line += f"\n{escape_md(i['summary'])}"
+            lines.append(line)
         description = ""
         for line in lines:
             if len(description) + len(line) + 1 > MAX_DESCRIPTION:
@@ -118,16 +134,16 @@ def build_embeds(digest: dict[str, list[dict]]) -> list[dict]:
     return embeds
 
 
-def digest_header(digest: dict[str, list[dict]]) -> tuple[str, str]:
+def digest_header(digest: dict[str, list[dict]], overview: str) -> tuple[str, str]:
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     total = sum(len(v) for v in digest.values())
     summary = f"{total} new stories from {len(digest)} sources" if digest else "No new stories in the last period."
-    return f"AI news digest: {today}", summary
+    return f"AI news digest: {today}", overview or summary
 
 
-def build_messages(digest: dict[str, list[dict]]) -> list[dict]:
-    title, summary = digest_header(digest)
-    header = f"🤖 **{title}**\n{summary}"
+def build_messages(digest: dict[str, list[dict]], overview: str = "") -> list[dict]:
+    title, summary = digest_header(digest, overview)
+    header = f"🤖 **{title}**\n{escape_md(summary)}"
     if not digest:
         return [{"content": header}]
 
@@ -144,12 +160,18 @@ def build_messages(digest: dict[str, list[dict]]) -> list[dict]:
     return messages
 
 
-def build_telegram_messages(digest: dict[str, list[dict]]) -> list[str]:
-    title, summary = digest_header(digest)
-    lines = [f"🤖 <b>{title}</b>", summary]
-    for source, items in digest.items():
-        lines += ["", f"<b>{html.escape(source)}</b>"]
-        lines += [f'• <a href="{html.escape(i["link"])}">{html.escape(i["title"][:200])}</a>' for i in items]
+def build_telegram_messages(digest: dict[str, list[dict]], overview: str = "") -> list[str]:
+    title, summary = digest_header(digest, overview)
+    lines = [f"🤖 <b>{title}</b>", html.escape(summary)]
+    for section, items in digest.items():
+        lines += ["", f"<b>{html.escape(section)}</b>"]
+        for i in items:
+            line = f'• <a href="{html.escape(i["link"])}">{html.escape(i["title"][:200])}</a>'
+            if i.get("source"):
+                line += f" · <i>{html.escape(i['source'])}</i>"
+            if i.get("summary"):
+                line += f"\n{html.escape(i['summary'])}"
+            lines.append(line)
 
     messages, current = [], ""
     for line in lines:
@@ -180,16 +202,16 @@ def post_json(service: str, url: str, payload: dict) -> None:
             raise RuntimeError(f"{service} returned {e.code}: {detail.decode(errors='replace')[:300]}") from e
 
 
-def post_discord(webhook_url: str, digest: dict[str, list[dict]]) -> int:
-    messages = build_messages(digest)
+def post_discord(webhook_url: str, digest: dict[str, list[dict]], overview: str) -> int:
+    messages = build_messages(digest, overview)
     for message in messages:
         post_json("Discord", webhook_url, {**message, "allowed_mentions": {"parse": []}})
         time.sleep(1)
     return len(messages)
 
 
-def post_telegram(token: str, chat_id: str, digest: dict[str, list[dict]]) -> int:
-    messages = build_telegram_messages(digest)
+def post_telegram(token: str, chat_id: str, digest: dict[str, list[dict]], overview: str) -> int:
+    messages = build_telegram_messages(digest, overview)
     for text in messages:
         post_json(
             "Telegram",
@@ -209,10 +231,19 @@ def main() -> None:
     per_source = int(os.getenv("MAX_PER_SOURCE") or 5)
     print(f"Collecting AI news from the last {lookback:g}h...", file=sys.stderr)
     digest = collect(lookback, per_source)
+    overview = ""
+    if os.getenv("OPENROUTER_API_KEY"):
+        try:
+            digest, overview = agents.run(digest, lookback)
+        except Exception as e:  # plain headlines are better than no digest at all
+            print(f"  ! AI editor failed, falling back to plain headlines: {e!r}", file=sys.stderr)
 
     if args.dry_run:
         sys.stdout.reconfigure(encoding="utf-8")
-        preview = {"discord": build_messages(digest), "telegram": build_telegram_messages(digest)}
+        preview = {
+            "discord": build_messages(digest, overview),
+            "telegram": build_telegram_messages(digest, overview),
+        }
         print(json.dumps(preview, indent=2, ensure_ascii=False))
         return
 
@@ -220,9 +251,9 @@ def main() -> None:
     telegram_token, telegram_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     destinations = {}
     if webhook_url:
-        destinations["Discord"] = lambda: post_discord(webhook_url, digest)
+        destinations["Discord"] = lambda: post_discord(webhook_url, digest, overview)
     if telegram_token and telegram_chat:
-        destinations["Telegram"] = lambda: post_telegram(telegram_token, telegram_chat, digest)
+        destinations["Telegram"] = lambda: post_telegram(telegram_token, telegram_chat, digest, overview)
     if not destinations:
         sys.exit(
             "No destination configured: set DISCORD_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
