@@ -1,0 +1,28 @@
+name: Daily AI news digest
+
+on:
+  schedule:
+    # Every day at 03:30 UTC. Adjust to your timezone: https://crontab.guru
+    - cron: "30 3 * * *"
+  workflow_dispatch: # allows a manual run from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Post digest to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          LOOKBACK_HOURS: "24"
+          MAX_PER_SOURCE: "5"
+        run: python ai_news.py
