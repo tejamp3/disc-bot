@@ -20,9 +20,12 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Post digest to Discord
+      - name: Post digest
         env:
+          # Destinations whose secrets are not set are skipped.
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOOKBACK_HOURS: "24"
           MAX_PER_SOURCE: "5"
         run: python ai_news.py

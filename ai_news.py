@@ -1,17 +1,20 @@
-"""Collect recent AI news from RSS/Atom feeds and post a digest to a Discord webhook.
+"""Collect recent AI news from RSS/Atom feeds and post a digest to Discord and/or Telegram.
 
 Usage:
-    python ai_news.py             # post the digest to DISCORD_WEBHOOK_URL
+    python ai_news.py             # post the digest to every configured destination
     python ai_news.py --dry-run   # print the digest instead of posting
 
-Environment:
-    DISCORD_WEBHOOK_URL   Discord channel webhook (required unless --dry-run)
+Environment (at least one destination is required unless --dry-run):
+    DISCORD_WEBHOOK_URL   Discord channel webhook
+    TELEGRAM_BOT_TOKEN    Telegram bot token from @BotFather
+    TELEGRAM_CHAT_ID      Telegram chat, group or channel to post to
     LOOKBACK_HOURS        Only include items newer than this (default 24)
     MAX_PER_SOURCE        Cap on items per source (default 5)
 """
 
 import argparse
 import calendar
+import html
 import json
 import os
 import re
@@ -54,6 +57,8 @@ EMBED_COLOR = 0x5865F2
 MAX_EMBEDS_PER_MESSAGE = 10
 MAX_CHARS_PER_MESSAGE = 5800
 MAX_DESCRIPTION = 4000
+# Telegram limit: 4096 characters per message.
+MAX_TELEGRAM_CHARS = 4000
 
 
 def fetch_items(name: str, url: str, since: float, limit: int) -> list[dict]:
@@ -113,12 +118,18 @@ def build_embeds(digest: dict[str, list[dict]]) -> list[dict]:
     return embeds
 
 
-def build_messages(digest: dict[str, list[dict]]) -> list[dict]:
-    total = sum(len(v) for v in digest.values())
+def digest_header(digest: dict[str, list[dict]]) -> tuple[str, str]:
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
-    header = f"🤖 **AI news digest: {today}**\n{total} new stories from {len(digest)} sources"
+    total = sum(len(v) for v in digest.values())
+    summary = f"{total} new stories from {len(digest)} sources" if digest else "No new stories in the last period."
+    return f"AI news digest: {today}", summary
+
+
+def build_messages(digest: dict[str, list[dict]]) -> list[dict]:
+    title, summary = digest_header(digest)
+    header = f"🤖 **{title}**\n{summary}"
     if not digest:
-        return [{"content": f"🤖 **AI news digest: {today}**\nNo new stories in the last period."}]
+        return [{"content": header}]
 
     messages, batch, size = [], [], 0
     for embed in build_embeds(digest):
@@ -133,20 +144,60 @@ def build_messages(digest: dict[str, list[dict]]) -> list[dict]:
     return messages
 
 
-def post(webhook_url: str, message: dict) -> None:
-    body = json.dumps({**message, "allowed_mentions": {"parse": []}}).encode()
+def build_telegram_messages(digest: dict[str, list[dict]]) -> list[str]:
+    title, summary = digest_header(digest)
+    lines = [f"🤖 <b>{title}</b>", summary]
+    for source, items in digest.items():
+        lines += ["", f"<b>{html.escape(source)}</b>"]
+        lines += [f'• <a href="{html.escape(i["link"])}">{html.escape(i["title"][:200])}</a>' for i in items]
+
+    messages, current = [], ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > MAX_TELEGRAM_CHARS:
+            messages.append(current.strip())
+            current = ""
+        current += line + "\n"
+    messages.append(current.strip())
+    return messages
+
+
+def post_json(service: str, url: str, payload: dict) -> None:
+    body = json.dumps(payload).encode()
     for attempt in range(3):
         req = urllib.request.Request(
-            webhook_url, data=body, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}
+            url, data=body, headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}
         )
         try:
             with urllib.request.urlopen(req, timeout=30):
                 return
         except urllib.error.HTTPError as e:
+            detail = e.read()
             if e.code == 429 and attempt < 2:  # rate limited: wait as instructed, then retry
-                time.sleep(float(json.loads(e.read() or b"{}").get("retry_after", 2)))
+                info = json.loads(detail or b"{}")
+                # Discord puts retry_after at the top level, Telegram under "parameters".
+                time.sleep(float(info.get("retry_after") or info.get("parameters", {}).get("retry_after", 2)))
                 continue
-            raise RuntimeError(f"Discord returned {e.code}: {e.read().decode(errors='replace')[:300]}") from e
+            raise RuntimeError(f"{service} returned {e.code}: {detail.decode(errors='replace')[:300]}") from e
+
+
+def post_discord(webhook_url: str, digest: dict[str, list[dict]]) -> int:
+    messages = build_messages(digest)
+    for message in messages:
+        post_json("Discord", webhook_url, {**message, "allowed_mentions": {"parse": []}})
+        time.sleep(1)
+    return len(messages)
+
+
+def post_telegram(token: str, chat_id: str, digest: dict[str, list[dict]]) -> int:
+    messages = build_telegram_messages(digest)
+    for text in messages:
+        post_json(
+            "Telegram",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}},
+        )
+        time.sleep(1)
+    return len(messages)
 
 
 def main() -> None:
@@ -157,20 +208,37 @@ def main() -> None:
     lookback = float(os.getenv("LOOKBACK_HOURS") or 24)
     per_source = int(os.getenv("MAX_PER_SOURCE") or 5)
     print(f"Collecting AI news from the last {lookback:g}h...", file=sys.stderr)
-    messages = build_messages(collect(lookback, per_source))
+    digest = collect(lookback, per_source)
 
     if args.dry_run:
         sys.stdout.reconfigure(encoding="utf-8")
-        print(json.dumps(messages, indent=2, ensure_ascii=False))
+        preview = {"discord": build_messages(digest), "telegram": build_telegram_messages(digest)}
+        print(json.dumps(preview, indent=2, ensure_ascii=False))
         return
 
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        sys.exit("DISCORD_WEBHOOK_URL is not set (use --dry-run to preview without posting)")
-    for message in messages:
-        post(webhook_url, message)
-        time.sleep(1)
-    print(f"Posted {len(messages)} message(s) to Discord.", file=sys.stderr)
+    telegram_token, telegram_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    destinations = {}
+    if webhook_url:
+        destinations["Discord"] = lambda: post_discord(webhook_url, digest)
+    if telegram_token and telegram_chat:
+        destinations["Telegram"] = lambda: post_telegram(telegram_token, telegram_chat, digest)
+    if not destinations:
+        sys.exit(
+            "No destination configured: set DISCORD_WEBHOOK_URL, or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID "
+            "(use --dry-run to preview without posting)"
+        )
+
+    # A failure in one destination should not stop the digest reaching the other.
+    failed = False
+    for name, send in destinations.items():
+        try:
+            print(f"Posted {send()} message(s) to {name}.", file=sys.stderr)
+        except (RuntimeError, OSError) as e:
+            failed = True
+            print(f"  ! {name}: {e}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
